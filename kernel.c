@@ -1,82 +1,40 @@
-// C言語の標準ライブラリ <stdint.h> や <stddef.h> がない環境（ベアメタル）のため、必要な型を自分で定義
+#include "kernel.h"
 
-typedef unsigned char uint8_t; // 8ビット(1バイト)の符号なし整数
-typedef unsigned int uint32_t; // 32ビットの符号なし整数 (RISC-V 32bit環境を想定)
-typedef uint32_t size_t;       // メモリのサイズや配列の要素数を表す型 (ここでは32ビット)
+extern char __bss[], __bss_end[], __stack_top[];
 
-extern char __bss[], __bss_end[], __stack_top[]; // リンカスクリプトによって定義される「シンボル」をC言語側で参照するための宣言
-
-/**
- * @brief メモリの指定領域を特定の値で埋める
- * @param buf 書き込み先のメモリアドレス
- * @param c 書き込む値
- * @param n 書き込むバイト数
- * @note 標準Cライブラリの memset と同じ機能
- * OS起動直後は標準ライブラリを使えないため、自作する必要がある
- */
-void *memset(void *buf, char c, size_t n)
+struct sbiret sbi_call(long arg0, long arg1, long arg2, long arg3, long arg4, long arg5, long fid, long eid)
 {
-    uint8_t *p = (uint8_t *)buf; // void* 型は直接操作できないため、1バイト単位で操作できる uint8_t* (char*) にキャスト
-    while (n--)                  // n バイト分ループ
-        *p++ = c;                // 1バイト書き込み、ポインタを次のメモリアドレスに進める
-    return buf;                  // 標準のmemsetの仕様にならい、書き込み先の先頭アドレスを返す
+    register long a0 __asm__("a0") = arg0;
+    register long a1 __asm__("a1") = arg1;
+    register long a2 __asm__("a2") = arg2;
+    register long a3 __asm__("a3") = arg3;
+    register long a4 __asm__("a4") = arg4;
+    register long a5 __asm__("a5") = arg5;
+    register long a6 __asm__("a6") = fid;
+    register long a7 __asm__("a7") = eid;
+
+    __asm__ __volatile__("ecall"
+                         : "=r"(a0), "=r"(a1)
+                         : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(a4), "r"(a5), "r"(a6), "r"(a7)
+                         : "memory");
+    return (struct sbiret){.error = a0, .value = a1};
 }
 
-/**
- * @brief C言語で記述されたカーネル本体のメイン関数
- */
+void putchar(char ch)
+{
+    sbi_call(ch, 0, 0, 0, 0, 0, 0, 1);
+}
+
 void kernel_main(void)
 {
-    /*
-     * .bssセクションのゼロクリア
-     * C言語の仕様では、初期値が指定されていないグローバル変数・静的変数は0で初期化されることになっている (これらが.bssセクションに配置される)
-     * OS起動直後は誰もこの初期化を行ってくれないため、OSが自分で .bss セクション全体を0で埋める必要がある
-     * (__bss_end - __bss) で .bss セクションの全サイズを計算
-     */
-    memset(__bss, 0, (size_t)__bss_end - (size_t)__bss);
-    /*
-     * ここで関数を終了 (return)した場合、戻り先がないためCPUが不正なアドレスにジャンプして暴走する可能性がある
-     * そのため、処理が完了した(あるいはやることがない)場合は、無限ループに入ってCPUを停止させる
-     */
+    const char *s = "\n\nHello World!\n";
+    for (int i = 0; s[i] != '\0'; i++)
+    {
+        putchar(s[i]);
+    }
+
     for (;;)
-        ; // 無限ループ (何もしない)
-}
-
-/*
- * OS起動時に最初に実行されるエントリーポイント
- * （リンカスクリプトによって、この関数が必ず最初に実行されるように配置されている）
- */
-
-// section(".text.boot"):
-//   この関数を ".text.boot" という名前の特別なセクションに配置
-//   （リンカスクリプト側で、このセクションをメモリの先頭に配置するよう指定してある）
-__attribute__((section(".text.boot"))) // __attribute__ はGCCに対する拡張命令
-
-// naked:
-//   コンパイラに「スタックにレジスタを退避する」などの定型処理を自動生成させないようにする
-//   この関数が呼ばれる時点では、スタックポインタ(sp)がまだ設定されておらず危険なので、コンパイラが余計なことをしないようにアセンブリで直接記述する
-__attribute__((naked)) void boot(void)
-{
-    // インラインアセンブリ (RISC-V 32bit)
-    __asm__ __volatile__(
-        /*
-         * スタックポインタ(sp)レジスタに、__stack_top のアドレスを設定
-         * __stack_top：リンカスクリプトで定義されたスタック領域の最上位アドレス
-         * これを設定して初めて、C言語の関数が安全に呼び出せるようになる
-         * %[stack_top] は、下のC言語変数 __stack_top の値を参照する
-         */
-        "mv sp, %[stack_top]\n"
-
-        /*
-         * C言語の kernel_main 関数にジャンプ
-         * (call ではなく j を使っているのは、ここに戻ってくる必要がないため)
-         */
-        "j kernel_main\n"
-
-        // --- コンパイラへの指示 ---
-        : // 出力オペランド (このアセンブリが書き換えるC言語変数 = なし)
-        : // 入力オペランド (アセンブリが読み込むC言語変数)
-
-        // [stack_top] という名前で、C言語の __stack_top 変数の値を"r" (レジスタ) に読み込んでアセンブリ側で使えるようにする
-        [stack_top] "r"(__stack_top));
+    {
+        __asm__ __volatile__("wfi");
+    }
 }
